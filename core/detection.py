@@ -178,9 +178,10 @@ def sample_grid_from_frame(
     frame_bgr: np.ndarray,
     config: GridConfig,
 ) -> np.ndarray:
-    """Sample cell colors from a corrected frame.
+    """Sample cell colors from a corrected frame (vectorized).
 
-    Samples from the center of each cell for noise robustness.
+    Samples a 3x3 patch around the center of each cell and averages for noise
+    robustness, using NumPy vectorized operations.
 
     Args:
         frame_bgr: Corrected BGR image of size (height, width, 3).
@@ -189,26 +190,29 @@ def sample_grid_from_frame(
     Returns:
         (grid_rows, grid_cols, 3) uint8 array in RGB.
     """
-    grid = np.zeros((config.grid_rows, config.grid_cols, 3), dtype=np.uint8)
     half = config.cell_size // 2
+    h, w = frame_bgr.shape[:2]
 
-    for r in range(config.grid_rows):
-        for c in range(config.grid_cols):
-            cy = config.margin + r * config.cell_size + half
-            cx = config.margin + c * config.cell_size + half
-            cy = min(cy, frame_bgr.shape[0] - 1)
-            cx = min(cx, frame_bgr.shape[1] - 1)
-            # Average a small area around center for noise reduction
-            y0 = max(0, cy - 1)
-            y1 = min(frame_bgr.shape[0], cy + 2)
-            x0 = max(0, cx - 1)
-            x1 = min(frame_bgr.shape[1], cx + 2)
-            patch = frame_bgr[y0:y1, x0:x1]
-            avg_bgr = patch.mean(axis=(0, 1)).astype(np.uint8)
-            # BGR to RGB
-            grid[r, c] = avg_bgr[::-1]
+    # Center coordinates for each cell
+    ys = np.arange(config.grid_rows) * config.cell_size + config.margin + half
+    xs = np.arange(config.grid_cols) * config.cell_size + config.margin + half
 
-    return grid
+    # Clamp to valid pixel range (leave room for ±1 patch)
+    ys = np.clip(ys, 1, h - 2).astype(np.intp)
+    xs = np.clip(xs, 1, w - 2).astype(np.intp)
+
+    # Build meshgrid of center positions
+    yy, xx = np.meshgrid(ys, xs, indexing='ij')  # (grid_rows, grid_cols)
+
+    # Accumulate 3x3 patch for averaging (float32 to avoid overflow)
+    acc = np.zeros((config.grid_rows, config.grid_cols, 3), dtype=np.float32)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            acc += frame_bgr[yy + dy, xx + dx].astype(np.float32)
+    avg_bgr = (acc / 9.0).astype(np.uint8)
+
+    # BGR to RGB
+    return avg_bgr[:, :, ::-1].copy()
 
 
 def is_sync_frame(grid: np.ndarray, config: GridConfig, threshold: float = 0.7) -> bool:
@@ -232,6 +236,123 @@ def is_sync_frame(grid: np.ndarray, config: GridConfig, threshold: float = 0.7) 
             total += 1
 
     return (matches / total) >= threshold if total > 0 else False
+
+
+class FiducialTracker:
+    """Tracks fiducial positions between frames to speed up detection.
+
+    First frame: full-scan detection (normal template matching).
+    Subsequent frames: search only in a small ROI around previous positions.
+    If positions are stable (< threshold drift), reuses the previous homography.
+    """
+
+    def __init__(self, roi_margin: int = 60, drift_threshold: float = 2.0):
+        self.roi_margin = roi_margin
+        self.drift_threshold = drift_threshold
+        self.last_positions: Optional[dict[str, tuple[float, float]]] = None
+        self.last_homography: Optional[np.ndarray] = None
+        self._templates: dict[str, np.ndarray] = {}
+        self._config: Optional[GridConfig] = None
+
+    def _ensure_templates(self, config: GridConfig, frame_h: int, frame_w: int) -> None:
+        """Build and cache scaled templates for the current config."""
+        if self._config is not None and self._config.cell_size == config.cell_size:
+            return
+        self._config = config
+        n = FIDUCIAL_SIZE_CELLS
+        patterns = get_fiducial_patterns(n)
+        scale_x = frame_w / config.width
+        scale_y = frame_h / config.height
+        for corner, pattern in patterns.items():
+            tmpl = _build_fiducial_template(pattern, config.cell_size)
+            if abs(scale_x - 1.0) > 0.05 or abs(scale_y - 1.0) > 0.05:
+                new_w = max(1, int(tmpl.shape[1] * scale_x))
+                new_h = max(1, int(tmpl.shape[0] * scale_y))
+                tmpl = cv2.resize(tmpl, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            self._templates[corner] = tmpl
+
+    def detect(
+        self, frame_gray: np.ndarray, config: GridConfig
+    ) -> Optional[tuple[dict[str, tuple[float, float]], Optional[np.ndarray]]]:
+        """Detect fiducials, using ROI tracking when possible.
+
+        Returns:
+            (positions_dict, homography_matrix) or None if detection fails.
+        """
+        h, w = frame_gray.shape[:2]
+        self._ensure_templates(config, h, w)
+
+        if self.last_positions is not None:
+            result = self._detect_in_rois(frame_gray, config)
+            if result is not None:
+                positions = result
+                H = self._compute_or_reuse_homography(positions, config)
+                self.last_positions = positions
+                self.last_homography = H
+                return positions, H
+
+        # Full scan fallback
+        detected = detect_fiducials(frame_gray, config)
+        if detected is None:
+            return None
+        H = compute_homography(detected, config)
+        self.last_positions = detected
+        self.last_homography = H
+        return detected, H
+
+    def _detect_in_rois(
+        self, frame_gray: np.ndarray, config: GridConfig
+    ) -> Optional[dict[str, tuple[float, float]]]:
+        """Search for fiducials only in ROIs around last known positions."""
+        h, w = frame_gray.shape[:2]
+        results = {}
+
+        for corner, (prev_x, prev_y) in self.last_positions.items():
+            tmpl = self._templates[corner]
+            tmpl_h, tmpl_w = tmpl.shape[:2]
+            margin = self.roi_margin
+
+            x1 = max(0, int(prev_x) - tmpl_w // 2 - margin)
+            y1 = max(0, int(prev_y) - tmpl_h // 2 - margin)
+            x2 = min(w, int(prev_x) + tmpl_w // 2 + margin)
+            y2 = min(h, int(prev_y) + tmpl_h // 2 + margin)
+
+            roi = frame_gray[y1:y2, x1:x2]
+            if roi.shape[0] < tmpl_h or roi.shape[1] < tmpl_w:
+                return None  # ROI too small — fall back to full scan
+
+            res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+            if max_val < 0.3:
+                return None
+
+            cx = x1 + max_loc[0] + tmpl_w // 2
+            cy = y1 + max_loc[1] + tmpl_h // 2
+            results[corner] = (float(cx), float(cy))
+
+        return results
+
+    def _compute_or_reuse_homography(
+        self, positions: dict[str, tuple[float, float]], config: GridConfig
+    ) -> Optional[np.ndarray]:
+        """Reuse last homography if positions haven't drifted significantly."""
+        if self.last_positions is not None and self.last_homography is not None:
+            max_drift = 0.0
+            for corner in positions:
+                if corner in self.last_positions:
+                    dx = positions[corner][0] - self.last_positions[corner][0]
+                    dy = positions[corner][1] - self.last_positions[corner][1]
+                    max_drift = max(max_drift, (dx * dx + dy * dy) ** 0.5)
+            if max_drift < self.drift_threshold:
+                return self.last_homography
+
+        return compute_homography(positions, config)
+
+    def reset(self) -> None:
+        """Clear tracking state (e.g., on scene change or config change)."""
+        self.last_positions = None
+        self.last_homography = None
 
 
 def process_frame(

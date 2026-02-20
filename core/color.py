@@ -37,7 +37,6 @@ def encode_byte_to_cells(data: bytes, color_levels: int) -> np.ndarray:
 
     # Convert bytes to a bit stream
     data_arr = np.frombuffer(data, dtype=np.uint8)
-    # Unpack each byte into 8 bits (MSB first)
     bits = np.unpackbits(data_arr)
 
     # Pad to a multiple of bits_per_cell
@@ -47,23 +46,21 @@ def encode_byte_to_cells(data: bytes, color_levels: int) -> np.ndarray:
         bits = np.concatenate([bits, np.zeros(bits_per_cell - remainder, dtype=np.uint8)])
 
     num_cells = len(bits) // bits_per_cell
-    cells = np.zeros((num_cells, 3), dtype=np.uint8)
 
-    for i in range(num_cells):
-        base = i * bits_per_cell
-        for ch in range(3):
-            ch_bits = bits[base + ch * bits_per_channel: base + (ch + 1) * bits_per_channel]
-            # Convert bits to an integer index
-            level_idx = 0
-            for b in ch_bits:
-                level_idx = (level_idx << 1) | int(b)
-            cells[i, ch] = values[level_idx]
+    # Reshape bits into (num_cells, 3, bits_per_channel)
+    bits_reshaped = bits[:num_cells * bits_per_cell].reshape(num_cells, 3, bits_per_channel)
 
+    # Convert groups of bits to level indices using positional weighting
+    # weights = [2^(bpc-1), ..., 2, 1]  (MSB first)
+    weights = (1 << np.arange(bits_per_channel - 1, -1, -1)).astype(np.uint8)
+    indices = (bits_reshaped * weights).sum(axis=2).astype(np.intp)  # (num_cells, 3)
+
+    cells = values[indices]  # fancy-index into the level LUT
     return cells
 
 
 def decode_cells_to_bytes(cells: np.ndarray, color_levels: int, num_bytes: int) -> bytes:
-    """Decode cell color values back to raw bytes.
+    """Decode cell color values back to raw bytes (vectorized).
 
     Args:
         cells: (N_cells, 3) array of uint8 color values (possibly noisy).
@@ -74,28 +71,32 @@ def decode_cells_to_bytes(cells: np.ndarray, color_levels: int, num_bytes: int) 
         Decoded bytes.
     """
     bits_per_channel = COLOR_LEVEL_BITS[color_levels]
-    bits_per_cell = bits_per_channel * 3
-    values = get_color_values(color_levels)
     thresholds = get_thresholds(color_levels)
 
-    bits = []
-    for i in range(cells.shape[0]):
-        for ch in range(3):
-            pixel_val = int(cells[i, ch])
-            # Quantize to nearest level
-            level_idx = int(np.searchsorted(thresholds, pixel_val))
-            # Convert index to bits (MSB first)
-            for bit_pos in range(bits_per_channel - 1, -1, -1):
-                bits.append((level_idx >> bit_pos) & 1)
+    # Quantize all channels at once: searchsorted on flattened values
+    flat = cells.ravel().astype(np.uint8)  # (N_cells * 3,)
+    indices = np.searchsorted(thresholds, flat).astype(np.uint8)  # level index per value
 
-    # Convert bits to bytes
-    bits_arr = np.array(bits[:num_bytes * 8], dtype=np.uint8)
-    # Pad if necessary
-    if len(bits_arr) < num_bytes * 8:
-        bits_arr = np.concatenate([
-            bits_arr,
-            np.zeros(num_bytes * 8 - len(bits_arr), dtype=np.uint8)
-        ])
+    # Reshape to (N_cells, 3)
+    indices = indices.reshape(-1, 3)
+
+    # Convert each index to bits_per_channel bits (MSB first) — vectorized
+    # Build a (bits_per_channel,) array of bit positions
+    shifts = np.arange(bits_per_channel - 1, -1, -1, dtype=np.uint8)
+    # indices shape (N, 3) → expand to (N, 3, bpc)
+    bits_expanded = ((indices[..., np.newaxis] >> shifts) & 1).astype(np.uint8)
+    # bits_expanded shape: (N_cells, 3, bits_per_channel)
+
+    # Flatten to a 1-D bit stream: cell-major, then channel, then bit
+    all_bits = bits_expanded.reshape(-1)
+
+    # Take only the bits we need and pack
+    needed = num_bytes * 8
+    if len(all_bits) >= needed:
+        bits_arr = all_bits[:needed]
+    else:
+        bits_arr = np.zeros(needed, dtype=np.uint8)
+        bits_arr[:len(all_bits)] = all_bits
 
     byte_arr = np.packbits(bits_arr)
     return bytes(byte_arr[:num_bytes])

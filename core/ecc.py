@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import math
 
-from reedsolo import RSCodec, ReedSolomonError
+try:
+    from creedsolo import RSCodec, ReedSolomonError  # C extension — ~10x faster
+except ImportError:
+    from reedsolo import RSCodec, ReedSolomonError   # fallback: pure Python
 
 from .config import ECCLevel
 
